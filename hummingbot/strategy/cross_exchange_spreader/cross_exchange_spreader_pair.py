@@ -9,15 +9,16 @@ class CrossExchangeSpreaderPair(NamedTuple):
     """
     Specifies a pair of markets for cross exchange spread.
 
-    e.g. If I want to market make on dydx AAVE-DAI, reference from FTX OTC AAVE-DAI and
+    e.g. If I want to market make on dydx AAVE-DAI,
+         reference from FTX OTC AAVE-DAI and
          hedge on Binance ETHUSDT:
 
          CrossExchangeSpreaderPair(
              dydx, "AAVE-DAI", "AAVE", "DAI",
-             ftx_otc, "AAVE-DAI", "AAVE", "DAI",
              binance, "ETHUSDT", "ETH", "USDT",
+             ftx_otc, "AAVE-DAI", "AAVE", "DAI",
          )
     """
     maker: MarketTradingPairTuple
+    taker: MarketTradingPairTuple
     ref: MarketTradingPairTuple
-    hedger: MarketTradingPairTuple
