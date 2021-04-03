@@ -1,8 +1,10 @@
 import logging
+
 from collections import defaultdict
-from typing import List, Tuple, Optional
 from decimal import Decimal
+from math import ceil, floor
 from libc.stdint cimport int64_t
+from typing import List, Tuple, Optional
 
 from hummingbot.core.clock cimport Clock
 from hummingbot.strategy.strategy_base cimport StrategyBase
@@ -11,10 +13,11 @@ from hummingbot.connector.exchange_base cimport ExchangeBase
 from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.core.data_type.limit_order cimport LimitOrder
 from hummingbot.core.data_type.limit_order import LimitOrder
+from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.event.events import OrderType
 from hummingbot.core.network_iterator import NetworkStatus
 
-from .cross_exchange_spreader_pair import CrossExchangeSpreaderPair
+from .cross_exchange_spreader_pairs import CrossExchangeSpreaderPairs
 from .order_id_market_pair_tracker import OrderIDMarketPairTracker
 
 NaN = float("nan")
@@ -41,8 +44,9 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
         return s_logger
 
     def __init__(self,
-                 market_pairs: List[CrossExchangeSpreaderPair],
+                 market_pairs: List[CrossExchangeSpreaderPairs],
                  order_amount: Optional[Decimal] = Decimal("0.0"),
+                 order_spread: Optional[Decimal] = Decimal("0.05"),
                  logging_options: int = OPTION_LOG_ALL,
                  status_report_interval: float = 900,
                  hb_app_notification: bool = False
@@ -67,17 +71,18 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
         }
         self._maker_markets = set([market_pair.maker.market for market_pair in market_pairs])
         self._ref_markets = set([market_pair.ref.market for market_pair in market_pairs])
-        self._taker_markets = set([market_pair.taker.market for market_pair in market_pairs])
-        self._market_pair_tracker = OrderIDMarketPairTracker()
         self._all_markets_ready = False
+        self._order_amount = order_amount
+        self._order_spread = order_spread
         self._logging_options = <int64_t> logging_options
         self._status_report_interval = status_report_interval
         self._last_timestamp = 0
+        self._market_pair_tracker = OrderIDMarketPairTracker()
         self._hb_app_notification = hb_app_notification
         self._maker_order_ids = []
 
         cdef:
-            list all_markets = list(self._maker_markets | self._ref_markets | self._maker_markets)
+            list all_markets = list(self._maker_markets | self._ref_markets)
 
         self.c_add_markets(all_markets)
 
@@ -105,6 +110,12 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
     @logging_options.setter
     def logging_options(self, int64_t logging_options):
         self._logging_options = logging_options
+
+    def format_status(self) -> str:
+        # TODO: format status
+        pass
+
+    # TODO: expose python methods for unit tests
 
     cdef c_start(self, Clock clock, double timestamp):
         StrategyBase.c_start(self, clock, timestamp)
@@ -165,11 +176,10 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
 
         For each market pair, only 1 active bid and ask is allowed.
 
-        :param market_pair: cross exchange market pai
+        :param market_pair: cross exchange market pair
         :param active_orders: list of active limit orders associated with the market pair
         """
         cdef:
-            ExchangeBase taker_market
             bint is_buy
             bint has_active_bid = False
             bint has_active_ask = False
@@ -177,32 +187,170 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
 
         global s_decimal_zero
 
-        # self.c_take_suggested_price_sample(market_pair)
-
         for active_order in active_orders:
             # Mark the has_active_bid and has_active_ask flags
             is_buy = active_order.is_buy
+
             if is_buy:
                 has_active_bid = True
             else:
                 has_active_ask = True
 
-        # TODO: Think through what needs to be done here
+            # check if need to adjust orders
 
-    cdef c_check_and_create_new_orders(self, object market_pair, bint has_active_bid, bint has_active_ask):
-        pass
+        # if bid and ask exist, no need to add orders
+        if has_active_bid and has_active_ask:
+            return
+
+        # place new orders
+        self.c_place_new_orders(market_pair, has_active_bid, has_active_ask)
+
+    cdef c_place_new_orders(self, object market_pair, bint has_active_bid, bint has_active_ask):
+        """
+        Check and place new limit orders at the right price.
+
+        :param market_pair: cross exchange market pair
+        :param has_active_bid: if active bid exists
+        :param has_active_ask: if active ask exists
+        """
+        if not has_active_bid:
+            bid_size = self.c_get_order_size(market_pair, True)
+
+            if bid_size > s_decimal_zero:
+                bid_price = self.c_get_order_limit_price(market_pair, True, bid_size)
+
+                if not Decimal.is_nan(bid_price):
+                    if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
+                        self.log_with_clock(
+                            logging.INFO,
+                            f"({market_pair.maker.trading_pair}) creating limit bid order for {bid_size} "
+                            f"{market_pair.maker.base_asset} at {bid_price} {market_pair.maker.quote_asset}"
+                        )
+                    order_id = self.c_place_order(market_pair, True, True, bid_size, bid_price)
+                else:
+                    if self._logging_options & self.OPTION_LOG_NULL_ORDER_SIZE:
+                        self.log_with_clock(
+                            logging.WARNING,
+                            f"({market_pair.maker.trading_pair}) unable to place order as order size is null"
+                        )
+            else:
+                if self._logging_options & self.OPTION_LOG_NULL_ORDER_SIZE:
+                    self.log_with_clock(
+                        logging.WARNING,
+                        f"({market_pair.maker.trading_pair}) Attempting to place a limit bid but the "
+                        f"bid size is 0. Skipping. Check available balance."
+                    )
+        if not has_active_ask:
+            ask_size = self.c_get_order_size(market_pair, False)
+
+            if ask_size > s_decimal_zero:
+                ask_price = self.c_get_order_limit_price(market_pair, False, ask_size)
+
+                if not Decimal.is_nan(ask_price):
+                    if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
+                        self.log_with_clock(
+                            logging.INFO,
+                            f"({market_pair.maker.trading_pair}) creating limit ask order for {bid_size} "
+                            f"{market_pair.maker.base_asset} at {bid_price} {market_pair.maker.quote_asset}"
+                        )
+                    order_id = self.c_place_order(market_pair, False, True, ask_size, ask_price)
+                else:
+                    if self._logging_options & self.OPTION_LOG_NULL_ORDER_SIZE:
+                        self.log_with_clock(
+                            logging.WARNING,
+                            f"({market_pair.maker.trading_pair}) unable to place order as order size is null"
+                        )
+            else:
+                if self._logging_options & self.OPTION_LOG_NULL_ORDER_SIZE:
+                    self.log_with_clock(
+                        logging.WARNING,
+                        f"({market_pair.maker.trading_pair}) Attempting to place a limit ask but the "
+                        f"ask size is 0. Skipping. Check available balance."
+                    )
+
+    cdef object c_get_order_size(self, object market_pair, bint is_bid):
+        """
+        Get market making order size given a market pair and side
+
+        :param market_pair: cross exchange market pair
+        :param is_bid: bid or ask
+        :return: size of maker order
+        """
+        cdef:
+            ExchangeBase maker_market = market_pair.maker.market
+
+        maker_balance = maker_market.c_get_available_balance(
+            market_pair.maker.quote_asset) if is_bid else maker_market.c_get_balance(market_pair.maker.base_asset)
+
+        user_order = self.c_get_limit_order_size(market_pair)
+
+        order_amount = min(maker_balance, user_order)
+
+        return maker_market.c_quantize_order_amount(market_pair.maker.trading_pair, Decimal(order_amount))
+
+    cdef object c_get_limit_order_size(self, object market_pair):
+        cdef:
+            ExchangeBase maker_market = market_pair.maker.market
+            str trading_pair = market_pair.maker.trading_pair
+
+        return maker_market.c_quantize_order_amount(trading_pair, Decimal(self._order_amount))
+
+    cdef object c_get_order_limit_price(self, object market_pair, bint is_bid, object size):
+        """
+        Get market making limit price by applying spread.
+
+        :param market_pair: cross exchange market pair
+        :param is_bid: bid or ask
+        :param size: size of the order
+        :return: limit price
+        """
+        cdef:
+            ExchangeBase maker_market = market_pair.maker.market
+            ExchangeBase ref_market = market_pair.ref.market
+            OrderBook maker_order_book = market_pair.maker.order_book
+            object top_bid_price = s_decimal_nan
+            object top_ask_price = s_decimal_nan
+
+        top_bid_price, top_ask_price = self.c_get_top_bid_ask(market_pair.ref.trading_pair, market_pair.ref.market)
+
+        if is_bid:
+            # TODO: Catch if top_bid_price is NaN
+            price_quantum = maker_market.c_get_order_price_quantum(market_pair.maker.trading_pair, top_bid_price)
+
+            maker_price = (floor(top_bid_price * (1 - self._order_spread) / price_quantum)) * price_quantum
+        else:
+            # TODO: Catch if top_ask_price is NaN
+            price_quantum = maker_market.c_get_order_price_quantum(market_pair.maker.trading_pair, top_ask_price)
+
+            maker_price = (ceil(top_ask_price * (1 + self._order_spread) / price_quantum)) * price_quantum
+
+        return maker_price
+
+    cdef tuple c_get_top_bid_ask(self, str trading_pair, ExchangeBase market):
+        """
+        Get top bid and ask
+
+        :param trading_pair: trading pair
+        :param market: market
+        :return: (top bid: Decimal, top ask: Decimal)
+        """
+
+        top_bid = market.c_get_price(trading_pair, False)
+
+        top_ask = market.c_get_price(trading_pair, True)
+
+        return top_bid, top_ask
 
     cdef str c_place_order(self,
                            object market_pair,
                            bint is_buy,
-                           bint is_maker,
                            object amount,
                            object price):
         cdef:
             str order_id
             double expiration_seconds = NaN
-            object market_info = market_pair.market if is_maker else market_pair.taker
-            object order_type = market_info.market.get_maker_order_type() if is_maker else market_info.market.get_taker_order_type()
+            object market_info = market_pair.market
+            object order_type = market_info.market.get_maker_order_type()
 
         if order_type is OrderType.MARKET:
             price = s_decimal_nan
@@ -218,8 +366,7 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
         self._sb_order_tracker.c_add_create_order_pending(order_id)
         self._market_pair_tracker.c_start_tracking_order_id(order_id, market_info.market, market_pair)
 
-        if is_maker:
-            self._maker_order_ids.append(order_id)
+        self._maker_order_ids.append(order_id)
 
         return order_id
 

@@ -5,9 +5,11 @@ from typing import NamedTuple
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 
 
-class CrossExchangeSpreaderPair(NamedTuple):
+class CrossExchangeSpreaderPairs(NamedTuple):
     """
-    Specifies a pair of markets for cross exchange spread.
+    Specifies reference pair for market making
+
+    TODO: Add ability to specify spread when defining pairs
 
     e.g. If I want to market make on dydx AAVE-DAI,
          reference from FTX OTC AAVE-DAI and
@@ -15,10 +17,9 @@ class CrossExchangeSpreaderPair(NamedTuple):
 
          CrossExchangeSpreaderPair(
              dydx, "AAVE-DAI", "AAVE", "DAI",
-             binance, "ETHUSDT", "ETH", "USDT",
              ftx_otc, "AAVE-DAI", "AAVE", "DAI",
+             binance, "ETHUSDT", "ETH", "USDT",
          )
     """
     maker: MarketTradingPairTuple
-    taker: MarketTradingPairTuple
     ref: MarketTradingPairTuple
