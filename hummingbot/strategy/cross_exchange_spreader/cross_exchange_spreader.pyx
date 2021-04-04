@@ -14,7 +14,7 @@ from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.core.data_type.limit_order cimport LimitOrder
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.order_book import OrderBook
-from hummingbot.core.event.events import OrderType
+from hummingbot.core.event.events import OrderType, TradeType
 from hummingbot.core.network_iterator import NetworkStatus
 
 from .cross_exchange_spreader_pairs import CrossExchangeSpreaderPairs
@@ -46,7 +46,7 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
     def __init__(self,
                  market_pairs: List[CrossExchangeSpreaderPairs],
                  order_amount: Optional[Decimal] = Decimal("0.0"),
-                 order_spread: Optional[Decimal] = Decimal("0.05"),
+                 order_spread: Optional[Decimal] = Decimal("0.005"),
                  logging_options: int = OPTION_LOG_ALL,
                  status_report_interval: float = 900,
                  hb_app_notification: bool = False
@@ -78,6 +78,8 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
         self._status_report_interval = status_report_interval
         self._last_timestamp = 0
         self._market_pair_tracker = OrderIDMarketPairTracker()
+        self._order_fill_buy_events = {}
+        self._order_fill_sell_events = {}
         self._hb_app_notification = hb_app_notification
         self._maker_order_ids = []
 
@@ -183,7 +185,7 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
             bint is_buy
             bint has_active_bid = False
             bint has_active_ask = False
-            bin need_adjust_order = False
+            bin need_to_adjust_order = False
 
         global s_decimal_zero
 
@@ -197,6 +199,10 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
                 has_active_ask = True
 
             # check if need to adjust orders
+            need_to_adjust_order = self.c_check_if_order_needs_to_adjust(market_pair, active_order)
+
+            if need_to_adjust_order:
+                self.c_cancel_order(market_pair, active_order)
 
         # if bid and ask exist, no need to add orders
         if has_active_bid and has_active_ask:
@@ -204,6 +210,26 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
 
         # place new orders
         self.c_place_new_orders(market_pair, has_active_bid, has_active_ask)
+
+    cdef c_check_if_order_needs_to_adjust(self, object market_pair, LimitOrder active_order):
+        """
+        Check if current active order is still
+        """
+        cdef:
+            bint is_buy = active_order.is_buy
+            object order_price = active_order.price
+            object order_quantity = active_order.quantity
+            object suggested_order_price = self.c_get_order_limit_price()
+
+        if suggested_order_price != order_price:
+            if self._logging_options & self.OPTION_LOG_ADJUST_ORDER:
+                self.log_with_clock(
+                    logging.INFO,
+                    f"({market_pair.maker.trading_pair}) adjusting current {'bid' if is_buy else 'ask'} for "
+                    f"{order_quantity} at {order_price} to {suggested_order_price}"
+                )
+            return True
+        return False
 
     cdef c_place_new_orders(self, object market_pair, bint has_active_bid, bint has_active_ask):
         """
@@ -373,6 +399,43 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
     cdef c_cancel_order(self, object market_pair, str order_id):
         market_trading_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(order_id)
         StrategyBase.c_cancel_order(self, market_trading_pair_tuple, order_id)
+
+    cdef c_did_fill_order(self, object order_filled_event):
+        """
+        What to do on order fill, for now do nothing
+        :param order_filled_event: event object
+        """
+        cdef:
+            str order_id = order_filled_event.order_id
+            object market_pair = self._market_pair_tracker.c_get_market_pair_from_order_id(order_id)
+            object exchange = self._market_pair_tracker.c_get_exchange_from_order_id(order_id)
+            tuple order_fill_record
+
+        if market_pair is not None and order_id in self._maker_order_ids:
+            limit_order_record = self._sb_order_tracker.c_get_shadow_limit_order(order_id)
+            order_fill_record = (limit_order_record, order_filled_event)
+
+            is_buy = order_filled_event.trade_type is TradeType.BUY
+
+            if is_buy:
+                if market_pair not in self._order_fill_buy_events:
+                    self._order_fill_buy_events[market_pair] = [order_fill_record]
+                else:
+                    self._order_fill_buy_events[market_pair].append(order_fill_record)
+            else:
+                if market_pair not in self._order_fill_sell_events:
+                    self._order_fill_sell_events[market_pair] = [order_fill_record]
+                else:
+                    self._order_fill_sell_events[market_pair].append(order_fill_record)
+
+            if self._logging_options & self.OPTION_LOG_MAKER_ORDER_FILLED:
+                self.log_with_clock(
+                    logging.INFO,
+                    f"({market_pair.maker.trading_pair}) {'Buy' if is_buy else 'Sell'} order of"
+                    f"{order_filled_event.amount} {market_pair.maker.base_asset} filled"
+                )
+
+            # TODO: Perform hedging here
 
     # Removes orders from pending_create
     cdef c_remove_create_order_pending(self, order_id):

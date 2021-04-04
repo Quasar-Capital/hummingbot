@@ -3,6 +3,8 @@
 from libc.stdint cimport int64_t
 from hummingbot.strategy.strategy_base cimport StrategyBase
 from hummingbot.connector.exchange_base cimport ExchangeBase
+from hummingbot.core.data_type.limit_order cimport LimitOrder
+
 from .order_id_market_pair_tracker import OrderIDMarketPairTracker
 
 cdef class CrossExchangeSpreaderStrategy(StrategyBase):
@@ -34,6 +36,8 @@ cdef class CrossExchangeSpreaderStrategy(StrategyBase):
                                         object market_pair,
                                         bint is_bid,
                                         object size)
+
+    cdef c_check_if_order_needs_to_adjust(self, object market_pair, LimitOrder active_order)
 
     cdef c_place_new_orders(self,
                             object market_pair,
